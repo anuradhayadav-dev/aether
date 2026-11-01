@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Aether</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;1,400&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#060608; --ink:#e9e7e2; --dim:rgba(233,231,226,.5); --line:rgba(233,231,226,.18); }
+  * { box-sizing:border-box; margin:0; }
+  html, body { height:100%; background:var(--bg); color:var(--ink); overflow:hidden;
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif; }
+  video { position:fixed; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1);
+    opacity:0; filter:brightness(.55) saturate(.8); transition:opacity .5s; }
+  body.bg video { opacity:1; }
+  canvas { position:fixed; inset:0; width:100%; height:100%; }
+  header { position:fixed; top:max(22px, env(safe-area-inset-top)); left:26px; }
+  h1 { font-family:"Cormorant Garamond",Georgia,"Times New Roman",serif; font-weight:400;
+    font-size:40px; letter-spacing:.01em; line-height:1; }
+  header p { margin-top:8px; font-size:12.5px; color:var(--dim); }
+  .bar { position:fixed; top:max(22px, env(safe-area-inset-top)); right:26px; display:flex; gap:8px; }
+  button { font:inherit; font-size:13px; color:var(--ink); background:rgba(6,6,8,.45); border:1px solid var(--line);
+    border-radius:999px; padding:9px 16px; cursor:pointer; backdrop-filter:blur(8px); transition:border-color .2s, background .2s; }
+  button:hover:not(:disabled) { border-color:rgba(233,231,226,.5); }
+  button:focus-visible { outline:2px solid var(--ink); outline-offset:2px; }
+  button:disabled { opacity:.35; cursor:default; }
+  button.on { background:var(--ink); color:#08080a; border-color:var(--ink); }
+  #status { position:fixed; bottom:max(24px, env(safe-area-inset-bottom)); left:50%; transform:translateX(-50%);
+    font-size:13px; color:var(--dim); white-space:nowrap; text-shadow:0 1px 8px #000; }
+  #guide { position:fixed; bottom:max(24px, env(safe-area-inset-bottom)); left:26px; font-size:12.5px; line-height:1.9;
+    color:var(--dim); text-shadow:0 1px 8px #000; }
+  @media (max-width:760px) { #guide { display:none; } h1 { font-size:32px; } .bar { right:16px; } header { left:16px; } }
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted></video>
+<canvas id="c"></canvas>
+
+<header>
+  <h1>Aether</h1>
+  <p>A particle sphere you steer with your hands</p>
+</header>
+<div class="bar">
+  <button id="camBtn">Enable camera</button>
+  <button id="bgBtn" disabled aria-pressed="false">Camera background</button>
+</div>
+<div id="guide">
+  One hand: move and spin<br>
+  Pinch and hold, then release: burst<br>
+  Two hands: spread to grow, close to shrink<br>
+  Fingers 0 to 5: change colour
+</div>
+<div id="status">Enable the camera to begin</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script>
+(() => {
+  const N = 3000;
+  const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  const video = document.getElementById('cam');
+  const camBtn = document.getElementById('camBtn'), bgBtn = document.getElementById('bgBtn');
+  const statusEl = document.getElementById('status');
+  let W = 0, H = 0, dpr = 1;
+
+  // ---------- particles ----------
+  const ux = new Float32Array(N), uy = new Float32Array(N), uz = new Float32Array(N);
+  const px = new Float32Array(N), py = new Float32Array(N), pz = new Float32Array(N);
+  const vx = new Float32Array(N), vy = new Float32Array(N), vz = new Float32Array(N);
+  const hx = new Float32Array(N), hy = new Float32Array(N), hz = new Float32Array(N);
+  const sz = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const y = 1 - 2 * (i + .5) / N, r = Math.sqrt(1 - y * y), th = i * 2.399963;
+    const k = 1 + (Math.random() - .5) * .05;
+    ux[i] = Math.cos(th) * r * k; uy[i] = y * k; uz[i] = Math.sin(th) * r * k;
+    sz[i] = .7 + Math.random() * .8;
+  }
+
+  // ---------- state ----------
+  const palette = [[236,236,242],[90,200,255],[90,255,175],[255,200,90],[255,110,170],[175,130,255]];
+  const names = ['Fist','One finger','Two fingers','Three fingers','Four fingers','Open hand'];
+  let col = [215,225,255], colTarget = col.slice();
+  let cx = 0, cy = 0, tx = 0, ty = 0, px0 = 0, py0 = 0;
+  let R = 200, Rt = 200, twoHandsUsed = false;
+  let rotX = -.3, rotY = 0, spinX = 0, spinY = .25;
+  let handsN = 0, lastSeen = -1e9, fingers = -1, cand = -1, candN = 0;
+  let pinching = false, pinchPt = {x:0,y:0}, tipA = {x:0,y:0}, tipB = {x:0,y:0};
+  let charge = 0, explT = 99, modelReady = false, camOn = false;
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = innerWidth; H = innerHeight;
+    cv.width = W * dpr; cv.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (!twoHandsUsed) Rt = Math.min(W, H) * .25;
+    if (!cx) { cx = tx = px0 = W / 2; cy = ty = py0 = H / 2; R = Rt; }
+  }
+  addEventListener('resize', resize); resize();
+
+  // map a MediaPipe landmark to screen px (mirrored, matches object-fit: cover video)
+  function map(p) {
+    const vw = video.videoWidth || 1280, vh = video.videoHeight || 720;
+    const s = Math.max(W / vw, H / vh);
+    return { x: (1 - p.x) * vw * s + (W - vw * s) / 2, y: p.y * vh * s + (H - vh * s) / 2 };
+  }
+  const dist = (h, a, b) => Math.hypot(h[a].x - h[b].x, h[a].y - h[b].y);
+
+  function countFingers(h) {
+    let n = 0;
+    for (const [t, p] of [[8,6],[12,10],[16,14],[20,18]]) if (dist(h,t,0) > dist(h,p,0) * 1.12) n++;
+    if (dist(h,4,17) > dist(h,2,17) * 1.15) n++;
+    return n;
+  }
+
+  // ---------- hand results ----------
+  function onResults(res) {
+    modelReady = true;
+    const L = res.multiHandLandmarks || [];
+    handsN = L.length;
+    if (!handsN) return;
+    lastSeen = performance.now();
+    if (handsN >= 2) {
+      const a = map(L[0][9]), b = map(L[1][9]);
+      tx = (a.x + b.x) / 2; ty = (a.y + b.y) / 2;
+      twoHandsUsed = true;
+      Rt = Math.max(40, Math.min(Math.max(W, H) * .6, Math.hypot(a.x - b.x, a.y - b.y) * .5));
+      pinching = false;
+      return;
+    }
+    const h = L[0], p = map(h[9]);
+    tx = p.x; ty = p.y;
+    tipA = map(h[4]); tipB = map(h[8]);
+    pinchPt = { x: (tipA.x + tipB.x) / 2, y: (tipA.y + tipB.y) / 2 };
+    const ratio = dist(h,4,8) / (dist(h,0,9) || 1);
+    if (!pinching && ratio < .27) pinching = true;
+    else if (pinching && ratio > .4) pinching = false;
+    if (!pinching) {
+      const n = countFingers(h);
+      if (n === cand) candN++; else { cand = n; candN = 1; }
+      if (candN >= 4 && n !== fingers) { fingers = n; colTarget = palette[n]; }
+    }
+  }
+
+  // ---------- explosion ----------
+  function explode(power) {
+    explT = 0;
+    for (let i = 0; i < N; i++) {
+      let dx = hx[i] / (R || 1) * .6 + (Math.random() - .5) * 1.6;
+      let dy = hy[i] / (R || 1) * .6 + (Math.random() - .5) * 1.6;
+      let dz = hz[i] / (R || 1) * .6 + (Math.random() - .5) * 1.6;
+      const m = Math.hypot(dx, dy, dz) || 1;
+      const sp = (500 + Math.random() * 1700) * (.55 + .9 * power);
+      vx[i] = dx / m * sp; vy[i] = dy / m * sp; vz[i] = dz / m * sp;
+    }
+  }
+
+  // ---------- main loop ----------
+  let last = performance.now(), lastStatus = '';
+  function frame(now) {
+    const dt = Math.min(.05, (now - last) / 1000); last = now;
+    const present = handsN > 0 && now - lastSeen < 450;
+    const single = present && handsN === 1;
+
+    // position
+    if (!present && now - lastSeen > 1500) { tx = W / 2; ty = H / 2; }
+    const f = 1 - Math.exp(-12 * dt);
+    cx += (tx - cx) * f; cy += (ty - cy) * f;
+    R += (Rt - R) * (1 - Math.exp(-8 * dt));
+
+    // rotation: hand movement spins the sphere, idle drifts slowly
+    if (present) { spinY += (cx - px0) * .0045; spinX += (cy - py0) * .0045; }
+    px0 = cx; py0 = cy;
+    const damp = Math.exp(-2.2 * dt);
+    spinX *= damp; spinY = (spinY - .25) * damp + .25;
+    spinX = Math.max(-6, Math.min(6, spinX)); spinY = Math.max(-8, Math.min(8, spinY));
+    rotY += spinY * dt; rotX += spinX * dt;
+
+    // charge / release
+    if (single && pinching) charge = Math.min(1, charge + dt / 1.4);
+    else {
+      if (single && charge > .12 && explT > 1.6) explode(charge);
+      charge = single ? 0 : Math.max(0, charge - dt * 3);
+    }
+
+    // colour
+    const cf = 1 - Math.exp(-6 * dt);
+    for (let k = 0; k < 3; k++) col[k] += (colTarget[k] - col[k]) * cf;
+    const rgb = `${col[0] | 0},${col[1] | 0},${col[2] | 0}`;
+
+    // physics
+    explT += dt;
+    const rf = Math.min(1, Math.max(0, (explT - .9) / .7));
+    const k = 20 * rf, drag = Math.exp(-(.9 + 7.6 * rf) * dt);
+    const cosY = Math.cos(rotY), sinY = Math.sin(rotY), cosX = Math.cos(rotX), sinX = Math.sin(rotX);
+    const Rc = R * (1 - .14 * charge), jit = charge * 3;
+
+    ctx.clearRect(0, 0, W, H);
+    const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, R * 1.5);
+    g.addColorStop(0, `rgba(${rgb},${.09 + .12 * charge})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = `rgb(${rgb})`;
+    const FOV = 1400;
+    for (let i = 0; i < N; i++) {
+      // home position on rotated sphere
+      let x = ux[i], y = uy[i], z = uz[i];
+      let x1 = x * cosY + z * sinY, z1 = -x * sinY + z * cosY;
+      let y1 = y * cosX - z1 * sinX, z2 = y * sinX + z1 * cosX;
+      const hxx = x1 * Rc + (jit ? (Math.random() - .5) * jit : 0);
+      const hyy = y1 * Rc + (jit ? (Math.random() - .5) * jit : 0);
+      const hzz = z2 * Rc;
+      hx[i] = hxx; hy[i] = hyy; hz[i] = hzz;
+
+      vx[i] = (vx[i] + (hxx - px[i]) * k * dt) * drag;
+      vy[i] = (vy[i] + (hyy - py[i]) * k * dt) * drag;
+      vz[i] = (vz[i] + (hzz - pz[i]) * k * dt) * drag;
+      px[i] += vx[i] * dt; py[i] += vy[i] * dt; pz[i] += vz[i] * dt;
+
+      const persp = FOV / Math.max(150, FOV - pz[i]);
+      const sx = cx + px[i] * persp, sy = cy + py[i] * persp;
+      if (sx < -10 || sx > W + 10 || sy < -10 || sy > H + 10) continue;
+      const depth = Math.max(-1, Math.min(1, pz[i] / (R || 1)));
+      ctx.globalAlpha = .28 + .6 * (depth + 1) / 2;
+      const s = sz[i] * 1.7 * persp;
+      ctx.fillRect(sx - s / 2, sy - s / 2, s, s);
+    }
+    ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+
+    // pinch feedback + charge ring
+    if (single) {
+      ctx.fillStyle = 'rgba(255,255,255,.7)';
+      for (const t of [tipA, tipB]) { ctx.beginPath(); ctx.arc(t.x, t.y, 3, 0, 6.2832); ctx.fill(); }
+      if (pinching) {
+        const r = 30 + (charge >= 1 ? Math.sin(now / 70) * 2 : 0);
+        ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(255,255,255,.2)';
+        ctx.beginPath(); ctx.arc(pinchPt.x, pinchPt.y, r, 0, 6.2832); ctx.stroke();
+        ctx.lineWidth = 3.5; ctx.lineCap = 'round'; ctx.strokeStyle = `rgb(${rgb})`;
+        ctx.beginPath(); ctx.arc(pinchPt.x, pinchPt.y, r, -Math.PI / 2, -Math.PI / 2 + 6.2832 * charge); ctx.stroke();
+      }
+    }
+
+    // status line
+    let s;
+    if (!camOn) s = lastStatus.startsWith('Camera') ? lastStatus : 'Enable the camera to begin';
+    else if (!modelReady) s = 'Loading hand model...';
+    else if (!present) s = 'Show a hand to the camera';
+    else if (handsN >= 2) s = 'Two hands: sphere size ' + Math.round(R);
+    else if (pinching) s = charge >= 1 ? 'Release to burst' : 'Charging ' + Math.round(charge * 100) + '%';
+    else s = fingers >= 0 ? names[fingers] : 'One hand';
+    if (s !== lastStatus) { statusEl.textContent = s; lastStatus = s; }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // ---------- camera ----------
+  let hands = null, busy = false;
+  async function loop() {
+    if (video.readyState >= 2 && !busy) {
+      busy = true;
+      try { await hands.send({ image: video }); } catch (e) { console.error(e); }
+      busy = false;
+    }
+    requestAnimationFrame(loop);
+  }
+  camBtn.addEventListener('click', async () => {
+    if (camOn) return;
+    if (typeof Hands === 'undefined') { statusEl.textContent = lastStatus = 'Camera model failed to load. Check your connection.'; return; }
+    camBtn.disabled = true;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, facingMode: 'user' }, audio: false });
+      video.srcObject = stream; await video.play();
+    } catch (e) {
+      camBtn.disabled = false;
+      statusEl.textContent = lastStatus = 'Camera blocked. Allow access, or serve this file from localhost.';
+      return;
+    }
+    hands = new Hands({ locateFile: f => 'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/' + f });
+    hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: .6, minTrackingConfidence: .5 });
+    hands.onResults(onResults);
+    camOn = true; camBtn.textContent = 'Camera on'; bgBtn.disabled = false;
+    loop();
+  });
+  bgBtn.addEventListener('click', () => {
+    const on = document.body.classList.toggle('bg');
+    bgBtn.classList.toggle('on', on); bgBtn.setAttribute('aria-pressed', on);
+  });
+})();
+</script>
+</body>
+</html>
